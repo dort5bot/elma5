@@ -1,0 +1,16 @@
+# Ortam değişkenleri
+.env
+
+# CSV logları
+*.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.python-version
+
+# VS Code / IDE
+.vscode/
+.idea/
