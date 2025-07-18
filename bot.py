@@ -19,7 +19,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 PORT = int(os.getenv("PORT", 10000))
-KEEP_ALIVE_URL = os.getenv("KEEP_ALIVE_URL")  # UptimeRobot’un ping atacağı Render URL (https://seninapp.onrender.com)
+KEEP_ALIVE_URL = os.getenv("KEEP_ALIVE_URL")
 
 # =============== CSV DOSYALARI ===============
 ap_csv = "ap_history.csv"
@@ -99,14 +99,46 @@ def get_keyboard():
     keys = [["AP", "H"], ["P BTC BNB"], ["F1", "F2", "F3"]]
     return ReplyKeyboardMarkup(keys, resize_keyboard=True)
 
+# =============== ALARM TEMİZLİK ===============
+def cleanup_old_alarms():
+    """Geçmiş tarihli tek seferlik alarmları CSV’den siler"""
+    if not os.path.exists(alarms_csv):
+        return
+    now = datetime.now()
+    with open(alarms_csv, "r", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    if len(rows) <= 1:
+        return
+    new_rows = [rows[0]]
+    removed_count = 0
+    for r in rows[1:]:
+        if r[1].startswith("ONCE"):
+            try:
+                alarm_time = datetime.strptime(r[1].replace("ONCE ", ""), "%Y-%m-%d %H:%M:%S")
+            except:
+                try:
+                    alarm_time = datetime.strptime(r[1].replace("ONCE ", ""), "%Y-%m-%d %H:%M")
+                except:
+                    new_rows.append(r)
+                    continue
+            if alarm_time < now:
+                removed_count += 1
+                continue
+        new_rows.append(r)
+    with open(alarms_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerows(new_rows)
+    if removed_count > 0:
+        print(f"[TEMİZLİK] {removed_count} eski ONCE alarmı silindi.")
+
 # =============== KOMUTLAR ===============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ Bot çalışıyor.\nKomutlardan birini seç veya yaz.\n"
-        "Alarm Kur: alarm 2025-07-20 08:00 ap f1\n"
-        "/list: mevcut listeleri gör\n"
-        "/addlist F4 BTC XRP ... yeni liste ekle\n"
-        "/dellist F4 listeyi sil",
+        "✅ Bot çalışıyor.\n"
+        "Alarm Kur: /alarm 21:00 ap f1 f2 (her gün)\n"
+        "/alarm 2025-07-20 23:00 ap f1 f2 (tek sefer)\n"
+        "/alarmlist : kurulu alarmları göster\n"
+        "/delalarm ID : alarmı sil",
         reply_markup=get_keyboard()
     )
 
@@ -137,7 +169,7 @@ async def ap_command(update: Update, context: ContextTypes.DEFAULT_TYPE, auto=Fa
 async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().upper()
     coins = []
-    if text.startswith("/"):  # /p btc bnb
+    if text.startswith("/"):
         coins = [c.upper() for c in context.args]
     else:
         parts = text.split()
@@ -165,41 +197,41 @@ async def f_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_csv(p_csv, [timestamp, text, coin, f"{price:.6f}"])
     await update.message.reply_text("\n".join(results), parse_mode="Markdown")
 
-async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "📋 *Mevcut F Listeleri:*\n"
-    for k, v in f_lists.items():
-        text += f"{k}: {', '.join(v)}\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
-
 # =============== ALARM İŞLEMLERİ ===============
 async def alarm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = update.message.text.split()
-        if len(args) < 3:
-            await update.message.reply_text("❌ Kullanım: alarm YYYY-MM-DD HH:MM komut1 komut2 ...")
+        if len(args) < 2:
+            await update.message.reply_text("❌ Kullanım: /alarm 21:00 ap f1 veya /alarm 2025-07-20 21:00 ap f1")
             return
-        dt_str = args[1]
-        if len(args[2]) == 5 and ":" in args[2]:  # alarm 08:00 ap f1
-            dt_str = f"{datetime.now().strftime('%Y-%m-%d')} {args[1]}"
+
+        if len(args[1]) == 5 and ":" in args[1]:  # sadece saat girilmiş (her gün)
+            alarm_time = datetime.strptime(args[1], "%H:%M").time()
             commands = args[2:]
-        else:  # alarm 2025-07-20 08:00 ap f1
+            context.job_queue.run_daily(trigger_alarm, time=alarm_time,
+                                        data={"commands": commands, "type": "DAILY", "time": args[1]})
+            save_csv(alarms_csv, [datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                  f"DAILY {args[1]}", " ".join(commands)])
+            await update.message.reply_text(f"✅ Günlük alarm kuruldu: {args[1]} → {' '.join(commands)}")
+        else:  # tam tarih girilmiş (tek sefer)
             dt_str = f"{args[1]} {args[2]}"
             commands = args[3:]
-        alarm_time = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
-
-        if alarm_time < datetime.now():
-            await update.message.reply_text("❌ Geçmiş bir tarih/saat olamaz.")
-            return
-
-        save_csv(alarms_csv, [datetime.now().strftime("%Y-%m-%d %H:%M"), alarm_time, " ".join(commands)])
-        context.job_queue.run_once(trigger_alarm, alarm_time, data={"commands": commands, "time": alarm_time})
-        await update.message.reply_text(f"✅ Alarm kuruldu: {alarm_time} → {' '.join(commands)}")
+            alarm_dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+            if alarm_dt < datetime.now():
+                await update.message.reply_text("❌ Geçmiş bir tarih/saat olamaz.")
+                return
+            context.job_queue.run_once(trigger_alarm, alarm_dt,
+                                       data={"commands": commands, "type": "ONCE", "time": alarm_dt})
+            save_csv(alarms_csv, [datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                  f"ONCE {alarm_dt}", " ".join(commands)])
+            await update.message.reply_text(f"✅ Tek seferlik alarm kuruldu: {alarm_dt} → {' '.join(commands)}")
     except Exception as e:
         await update.message.reply_text(f"❌ Alarm kurulamadı: {e}")
 
 async def trigger_alarm(context: ContextTypes.DEFAULT_TYPE):
     job_data = context.job.data
     commands = job_data["commands"]
+    alarm_type = job_data["type"]
     alarm_time = job_data["time"]
 
     buttons = [
@@ -208,7 +240,7 @@ async def trigger_alarm(context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔁 Tekrar Kur", callback_data=f"repeat_{alarm_time}")
         ]
     ]
-    msg = f"⏰ *Alarm*: {alarm_time}\nKomutlar: {' '.join(commands)}"
+    msg = f"⏰ *Alarm ({alarm_type})*: {alarm_time}\nKomutlar: {' '.join(commands)}"
     await context.bot.send_message(
         chat_id=CHAT_ID,
         text=msg,
@@ -221,7 +253,6 @@ async def trigger_alarm(context: ContextTypes.DEFAULT_TYPE):
         if cmd.lower() == "ap":
             await ap_command(fake_update, context, auto=True)
         elif cmd.upper() in f_lists:
-            await context.bot.send_message(chat_id=CHAT_ID, text=f"⏳ {cmd} çalışıyor...")
             await f_list(fake_update, context)
         elif cmd.upper().startswith("P"):
             await price_command(fake_update, context)
@@ -234,7 +265,46 @@ async def alarm_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith("repeat_"):
         alarm_time = datetime.now() + timedelta(days=1)
         await query.edit_message_text(f"🔁 Alarm tekrarlandı: {alarm_time}")
-        context.job_queue.run_once(trigger_alarm, alarm_time, data={"commands": ["ap"], "time": alarm_time})
+        context.job_queue.run_once(trigger_alarm, alarm_time,
+                                   data={"commands": ["ap"], "type": "ONCE", "time": alarm_time})
+
+async def alarmlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cleanup_old_alarms()
+    if not os.path.exists(alarms_csv):
+        await update.message.reply_text("⏹ Hiç alarm yok.")
+        return
+    with open(alarms_csv, "r", encoding="utf-8") as f:
+        rows = list(csv.reader(f))[1:]
+    if not rows:
+        await update.message.reply_text("⏹ Hiç alarm yok.")
+        return
+    text = "📋 *Kurulu Alarmlar:*\n"
+    for i, r in enumerate(rows, 1):
+        text += f"{i}) {r[1]} → {r[2]}\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def delalarm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        args = update.message.text.split()
+        if len(args) < 2:
+            await update.message.reply_text("❌ Kullanım: /delalarm ID")
+            return
+        alarm_id = int(args[1])
+        if not os.path.exists(alarms_csv):
+            await update.message.reply_text("⏹ Alarm yok.")
+            return
+        with open(alarms_csv, "r", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        if alarm_id <= 0 or alarm_id >= len(rows):
+            await update.message.reply_text("❌ Geçersiz ID.")
+            return
+        removed = rows.pop(alarm_id)
+        with open(alarms_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerows(rows)
+        await update.message.reply_text(f"✅ Alarm silindi: {removed[1]} → {removed[2]}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Alarm silinemedi: {e}")
 
 # =============== GÜNLÜK TEMİZLİK ===============
 async def daily_cleanup(context: ContextTypes.DEFAULT_TYPE):
@@ -250,9 +320,11 @@ async def daily_cleanup(context: ContextTypes.DEFAULT_TYPE):
                 writer = csv.writer(f)
                 writer.writerow(["Timestamp", "BTC", "USDT", "LONG"])
                 writer.writerow([now, f"{btc_avg:.2f}", f"{usdt_avg:.2f}", f"{long_avg:.2f}"])
+
+    cleanup_old_alarms()
     await context.bot.send_message(chat_id=CHAT_ID, text="✅ Günlük temizlik tamamlandı.")
 
-# =============== KEEP-ALIVE (UptimeRobot uyumlu) ===============
+# =============== KEEP-ALIVE ===============
 def keep_alive():
     if not KEEP_ALIVE_URL:
         print("KEEP_ALIVE_URL ayarlanmamış, ping yapılmayacak.")
@@ -263,7 +335,7 @@ def keep_alive():
             print(f"[KEEP-ALIVE] Ping gönderildi → {KEEP_ALIVE_URL}")
         except Exception as e:
             print(f"[KEEP-ALIVE] Hata: {e}")
-        time_module.sleep(60 * 5)  # Her 5 dakikada bir ping at
+        time_module.sleep(60 * 5)
 
 # =============== ANA FONKSİYON ===============
 def main():
@@ -272,8 +344,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ap", ap_command))
     app.add_handler(CommandHandler("p", price_command))
-    app.add_handler(CommandHandler("list", list_command))
     app.add_handler(CommandHandler("alarm", alarm_command))
+    app.add_handler(CommandHandler("alarmlist", alarmlist_command))
+    app.add_handler(CommandHandler("delalarm", delalarm_command))
     app.add_handler(CallbackQueryHandler(alarm_buttons))
     app.add_handler(MessageHandler(filters.Regex("^(AP|ap)$"), lambda u, c: ap_command(u, c)))
     app.add_handler(MessageHandler(filters.Regex("^P "), price_command))
@@ -281,14 +354,12 @@ def main():
 
     app.job_queue.run_daily(daily_cleanup, time=time(hour=21, minute=0))
 
-    # Keep-alive başlat
     threading.Thread(target=keep_alive, daemon=True).start()
-
     print("Bot Webhook ile çalışıyor...")
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path="",  # boş bırakılırsa token otomatik kullanılır
+        url_path="",
         webhook_url=KEEP_ALIVE_URL
     )
 
